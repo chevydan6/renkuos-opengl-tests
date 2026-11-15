@@ -1,0 +1,104 @@
+From 1d7a2048ab901a03aac63af74da04c8186bf142b Mon Sep 17 00:00:00 2001
+From: Port <port@localhost>
+Date: Sat, 14 Nov 2026 15:55:46 +0900
+Subject: [PATCH] Haiku EGL dispatch and requested context profiles
+
+---
+ include/renderdoc_app.h                 |  2 +-
+ src/egl/drivers/haiku/egl_haiku.cpp     | 22 ++++++++++++++++++++--
+ src/gallium/frontends/hgl/hgl.c         |  8 ++++----
+ src/gallium/frontends/hgl/hgl_context.h |  2 +-
+ 4 files changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/include/renderdoc_app.h b/include/renderdoc_app.h
+index b2d10c5..debd0c7 100644
+--- a/include/renderdoc_app.h
++++ b/include/renderdoc_app.h
+@@ -35,7 +35,7 @@
+ 
+ #if defined(WIN32) || defined(__WIN32__) || defined(_WIN32) || defined(_MSC_VER)
+ #define RENDERDOC_CC __cdecl
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__HAIKU__)
+ #define RENDERDOC_CC
+ #elif defined(__APPLE__)
+ #define RENDERDOC_CC
+diff --git a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haiku.cpp
+index f2f75c0..7aac030 100644
+--- a/src/egl/drivers/haiku/egl_haiku.cpp
++++ b/src/egl/drivers/haiku/egl_haiku.cpp
+@@ -441,11 +441,29 @@ haiku_create_context(_EGLDisplay *disp, _EGLConfig *conf,
+    if (!_eglInitContext(&context->base, disp, conf, share_list, attrib_list))
+       goto cleanup;
+ 
++   gl_api profile;
++   if (context->base.ClientAPI == EGL_OPENGL_API) {
++      const int major = context->base.ClientMajorVersion;
++      const int minor = context->base.ClientMinorVersion;
++      profile = (major == 3 && minor == 1) ||
++                ((major > 3 || (major == 3 && minor >= 2)) &&
++                 context->base.Profile == EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR)
++                   ? API_OPENGL_CORE : API_OPENGL_COMPAT;
++   } else if (context->base.ClientAPI == EGL_OPENGL_ES_API) {
++      profile = context->base.ClientMajorVersion == 1 ? API_OPENGLES : API_OPENGLES2;
++   } else {
++      _eglError(EGL_BAD_PARAMETER, "eglCreateContext");
++      goto cleanup;
++   }
++
+    context->ctx = hgl_create_context(
+       hgl_dpy->disp, &visual,
+-      share_list == NULL ? NULL : haiku_egl_context(share_list)->ctx->st);
+-   if (context->ctx == NULL)
++      share_list == NULL ? NULL : haiku_egl_context(share_list)->ctx->st,
++      profile, context->base.ClientMajorVersion, context->base.ClientMinorVersion);
++   if (context->ctx == NULL) {
++      _eglError(EGL_BAD_MATCH, "eglCreateContext: unsupported API or version");
+       goto cleanup;
++   }
+ 
+    return &context->base;
+ 
+diff --git a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
+index e91ffeb..106a6a6 100644
+--- a/src/gallium/frontends/hgl/hgl.c
++++ b/src/gallium/frontends/hgl/hgl.c
+@@ -262,7 +262,7 @@ hgl_destroy_st_framebuffer(struct hgl_buffer *buffer)
+ 
+ 
+ struct hgl_context*
+-hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct st_context* shared)
++hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct st_context* shared, int profile, int major, int minor)
+ {
+ 	struct hgl_context* context = CALLOC_STRUCT(hgl_context);
+ 	assert(context);
+@@ -271,10 +271,10 @@ hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct
+ 	struct st_context_attribs attribs;
+ 	memset(&attribs, 0, sizeof(attribs));
+ 	attribs.options.force_glsl_extensions_warn = false;
+-	attribs.profile = API_OPENGL_COMPAT;
++	attribs.profile = profile;
+ 	attribs.visual = *visual;
+-	attribs.major = 1;
+-	attribs.minor = 0;
++	attribs.major = major;
++	attribs.minor = minor;
+ 
+ 	enum st_context_error result;
+ 	context->st = st_api_create_context(display->fscreen, &attribs, &result, shared);
+diff --git a/src/gallium/frontends/hgl/hgl_context.h b/src/gallium/frontends/hgl/hgl_context.h
+index 4ec985e..2cabe8f 100644
+--- a/src/gallium/frontends/hgl/hgl_context.h
++++ b/src/gallium/frontends/hgl/hgl_context.h
+@@ -83,7 +83,7 @@ struct hgl_context
+ struct hgl_buffer* hgl_create_st_framebuffer(struct hgl_display *display, struct st_visual* visual, void *winsysContext);
+ void hgl_destroy_st_framebuffer(struct hgl_buffer *buffer);
+ 
+-struct hgl_context* hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct st_context* shared);
++struct hgl_context* hgl_create_context(struct hgl_display *display, struct st_visual* visual, struct st_context* shared, int profile, int major, int minor);
+ void hgl_destroy_context(struct hgl_context* context);
+ 
+ // hgl visual
+-- 
+2.43.0
+

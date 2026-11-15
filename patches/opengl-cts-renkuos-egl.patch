@@ -1,0 +1,585 @@
+diff --git a/framework/delibs/dethread/unix/deThreadUnix.c b/framework/delibs/dethread/unix/deThreadUnix.c
+index d045bb3..1cf9beb 100644
+--- a/framework/delibs/dethread/unix/deThreadUnix.c
++++ b/framework/delibs/dethread/unix/deThreadUnix.c
+@@ -36,7 +36,7 @@
+ #include <unistd.h>
+ #include <pthread.h>
+ #include <sched.h>
+-#if (DE_OS == DE_OS_UNIX) || (DE_OS == DE_OS_ANDROID)
++#if defined(__linux__) || (DE_OS == DE_OS_ANDROID)
+ #include <sys/syscall.h>
+ #endif
+ 
+@@ -161,7 +161,7 @@ void deYield(void)
+     sched_yield();
+ }
+ 
+-#if (DE_OS == DE_OS_UNIX) || (DE_OS == DE_OS_ANDROID)
++#if defined(__linux__) || (DE_OS == DE_OS_ANDROID)
+ 
+ uint32_t deGetNumAvailableLogicalCores(void)
+ {
+diff --git a/framework/delibs/deutil/CMakeLists.txt b/framework/delibs/deutil/CMakeLists.txt
+index d47b8ed..4a18c43 100644
+--- a/framework/delibs/deutil/CMakeLists.txt
++++ b/framework/delibs/deutil/CMakeLists.txt
+@@ -32,7 +32,8 @@ include_directories(
+ 	../depool
+ 	)
+ 
+-if (DE_OS_IS_UNIX)
++if (DE_OS_IS_UNIX AND NOT CMAKE_SYSTEM_NAME STREQUAL "Haiku")
++	# Haiku provides these interfaces in the automatically linked libroot.
+ 	set(DEUTIL_LIBS ${DEUTIL_LIBS} rt dl)
+ endif ()
+ 
+diff --git a/framework/platform/haiku/eglContextLifetimeTest.cpp b/framework/platform/haiku/eglContextLifetimeTest.cpp
+new file mode 100644
+index 0000000..4f95056
+--- /dev/null
++++ b/framework/platform/haiku/eglContextLifetimeTest.cpp
+@@ -0,0 +1,42 @@
++/* Standalone regression test for the Haiku EGL factory. */
++#include "tcuCommandLine.hpp"
++#include "tcuPlatform.hpp"
++#include "gluPlatform.hpp"
++#include "gluRenderConfig.hpp"
++#include "gluRenderContext.hpp"
++#include "glwFunctions.hpp"
++#include <EGL/egl.h>
++#include <GL/gl.h>
++#include <cstdio>
++#include <memory>
++
++glu::ContextFactory *createHaikuEglFactory();
++int main()
++{
++    std::unique_ptr<glu::ContextFactory> factory(createHaikuEglFactory());
++    tcu::CommandLine cmd;
++    glu::RenderConfig config(glu::ContextType(4,6,glu::PROFILE_CORE));
++    config.surfaceType = glu::RenderConfig::SURFACETYPE_OFFSCREEN_GENERIC;
++    std::unique_ptr<glu::RenderContext> first(factory->createContext(config,cmd,nullptr));
++    EGLContext firstHandle = eglGetCurrentContext();
++    std::unique_ptr<glu::RenderContext> second(factory->createContext(config,cmd,nullptr));
++    first->makeCurrent();
++    second.reset();
++    if (eglGetCurrentContext() != firstHandle || !first->getFunctions().getString(GL_VERSION)) {
++        std::fprintf(stderr,"destroying another context disrupted the current context\n"); return 1;
++    }
++    glu::RenderConfig invalid = config;
++    invalid.id = 1; invalid.depthBits = 32;
++    bool rejected = false;
++    try { std::unique_ptr<glu::RenderContext> bad(factory->createContext(invalid,cmd,nullptr)); }
++    catch (const tcu::NotSupportedError &) { rejected = true; }
++    if (!rejected || eglGetCurrentContext() != firstHandle || !first->getFunctions().getString(GL_VERSION)) {
++        std::fprintf(stderr,"invalid config was accepted or disrupted the current context\n"); return 2;
++    }
++    first->getFunctions().clearColor(1.f,0.f,0.f,1.f);
++    first->getFunctions().clear(GL_COLOR_BUFFER_BIT);
++    unsigned char pixel[4] = {};
++    first->getFunctions().readPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);
++    if (pixel[0] != 255 || pixel[1] || pixel[2] || pixel[3] != 255) return 3;
++    std::puts("independent contexts, rejected config, and surviving framebuffer passed");
++}
+diff --git a/framework/platform/haiku/tcuHaikuEgl.cpp b/framework/platform/haiku/tcuHaikuEgl.cpp
+new file mode 100644
+index 0000000..2189311
+--- /dev/null
++++ b/framework/platform/haiku/tcuHaikuEgl.cpp
+@@ -0,0 +1,173 @@
++/* SPDX-License-Identifier: MIT */
++/* EGL offscreen context factory for RenkuOS / Haiku. */
++#include "tcuPlatform.hpp"
++#include "tcuRenderTarget.hpp"
++#include "gluPlatform.hpp"
++#include "gluRenderContext.hpp"
++#include "gluRenderConfig.hpp"
++#include "glwFunctions.hpp"
++#include "glwFunctionLoader.hpp"
++#include <Application.h>
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GL/gl.h>
++#include <cstdio>
++#include <mutex>
++#include <vector>
++
++namespace {
++std::mutex displayMutex;
++EGLDisplay sharedDisplay = EGL_NO_DISPLAY;
++unsigned int displayUsers = 0;
++
++bool meetsMinimum(int requested, EGLint actual)
++{
++    return requested == glu::RenderConfig::DONT_CARE || actual >= requested;
++}
++
++class EglLoader : public glw::FunctionLoader {
++public:
++    glw::GenericFuncType get(const char *name) const override {
++        return reinterpret_cast<glw::GenericFuncType>(eglGetProcAddress(name));
++    }
++};
++class EglContext : public glu::RenderContext {
++public:
++    explicit EglContext(const glu::RenderConfig &config)
++        : m_type(config.type), m_display(EGL_NO_DISPLAY), m_context(EGL_NO_CONTEXT), m_surface(EGL_NO_SURFACE), m_displayAcquired(false) {
++        if (glu::isContextTypeES(config.type))
++            TCU_THROW(NotSupportedError, "Haiku EGL config does not currently expose OpenGL ES");
++        if (config.type.getFlags() != 0 || config.resetNotificationStrategy != glu::RESET_NOTIFICATION_STRATEGY_NOT_SPECIFIED)
++            TCU_THROW(NotSupportedError, "Haiku EGL context flags and reset notification are not implemented");
++        if (config.surfaceType != glu::RenderConfig::SURFACETYPE_DONT_CARE &&
++            config.surfaceType != glu::RenderConfig::SURFACETYPE_OFFSCREEN_GENERIC)
++            TCU_THROW(NotSupportedError, "Haiku EGL backend supports pbuffer surfaces only");
++        if (config.windowVisibility == glu::RenderConfig::VISIBILITY_FULLSCREEN ||
++            config.componentType == glu::RenderConfig::COMPONENT_TYPE_FLOAT)
++            TCU_THROW(NotSupportedError, "Fullscreen and floating-point surfaces are unavailable");
++        const int width = config.width == glu::RenderConfig::DONT_CARE ? 256 : config.width;
++        const int height = config.height == glu::RenderConfig::DONT_CARE ? 256 : config.height;
++        if (width <= 0 || height <= 0)
++            TCU_THROW(NotSupportedError, "Invalid EGL pbuffer dimensions");
++        if (!be_app) {
++            static BApplication app("application/x-vnd.renkuos-glcts-egl");
++        }
++        try {
++            {
++                std::lock_guard<std::mutex> lock(displayMutex);
++                m_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++                if (m_display == EGL_NO_DISPLAY ||
++                    (displayUsers == 0 && !eglInitialize(m_display, nullptr, nullptr)) ||
++                    (displayUsers != 0 && sharedDisplay != m_display))
++                    TCU_THROW(ResourceError, "Could not initialize Haiku EGL display");
++                sharedDisplay = m_display;
++                ++displayUsers;
++                m_displayAcquired = true;
++            }
++            if (!eglBindAPI(EGL_OPENGL_API))
++                TCU_THROW(ResourceError, "Could not bind EGL OpenGL API");
++            const EGLint attrs[] = { EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
++                EGL_RED_SIZE, config.redBits, EGL_GREEN_SIZE, config.greenBits, EGL_BLUE_SIZE, config.blueBits,
++                EGL_ALPHA_SIZE, config.alphaBits, EGL_DEPTH_SIZE, config.depthBits, EGL_STENCIL_SIZE, config.stencilBits,
++                EGL_SAMPLES, config.numSamples, EGL_CONFIG_ID, config.id, EGL_NONE };
++            EGLint count = 0;
++            if (!eglChooseConfig(m_display, attrs, nullptr, 0, &count) || count <= 0)
++                TCU_THROW(NotSupportedError, "No matching EGL pbuffer configuration");
++            std::vector<EGLConfig> configs(count);
++            if (!eglChooseConfig(m_display, attrs, configs.data(), count, &count))
++                TCU_THROW(ResourceError, "Could not enumerate EGL configurations");
++            EGLConfig selected = nullptr;
++            EGLint red=0,green=0,blue=0,alpha=0,depth=0,stencil=0,samples=0;
++            for (EGLint i=0; i<count; ++i) {
++                EGLint surfaceTypes=0, renderableTypes=0;
++                EGLConfig candidate = configs[i];
++                if (!eglGetConfigAttrib(m_display,candidate,EGL_RED_SIZE,&red) ||
++                    !eglGetConfigAttrib(m_display,candidate,EGL_GREEN_SIZE,&green) ||
++                    !eglGetConfigAttrib(m_display,candidate,EGL_BLUE_SIZE,&blue) ||
++                    !eglGetConfigAttrib(m_display,candidate,EGL_ALPHA_SIZE,&alpha) ||
++                    !eglGetConfigAttrib(m_display,candidate,EGL_DEPTH_SIZE,&depth) ||
++                    !eglGetConfigAttrib(m_display,candidate,EGL_STENCIL_SIZE,&stencil) ||
++                    !eglGetConfigAttrib(m_display,candidate,EGL_SAMPLES,&samples) ||
++                    !eglGetConfigAttrib(m_display,candidate,EGL_SURFACE_TYPE,&surfaceTypes) ||
++                    !eglGetConfigAttrib(m_display,candidate,EGL_RENDERABLE_TYPE,&renderableTypes))
++                    TCU_THROW(ResourceError, "Could not query EGL configuration");
++                // EGL_CONFIG_ID takes precedence over the other eglChooseConfig attributes.
++                if ((surfaceTypes & EGL_PBUFFER_BIT) && (renderableTypes & EGL_OPENGL_BIT) &&
++                    meetsMinimum(config.redBits,red) && meetsMinimum(config.greenBits,green) &&
++                    meetsMinimum(config.blueBits,blue) && meetsMinimum(config.alphaBits,alpha) &&
++                    meetsMinimum(config.depthBits,depth) && meetsMinimum(config.stencilBits,stencil) &&
++                    (config.numSamples == glu::RenderConfig::DONT_CARE || samples == config.numSamples)) {
++                    selected = candidate;
++                    break;
++                }
++            }
++            if (!selected)
++                TCU_THROW(NotSupportedError, "EGL configuration does not meet the requested framebuffer requirements");
++            const EGLint surfAttrs[] = { EGL_WIDTH, width, EGL_HEIGHT, height, EGL_NONE };
++            m_surface = eglCreatePbufferSurface(m_display, selected, surfAttrs);
++            if (m_surface == EGL_NO_SURFACE)
++                TCU_THROW(NotSupportedError, "Could not create EGL pbuffer");
++            std::vector<EGLint> ctx;
++            ctx.push_back(EGL_CONTEXT_MAJOR_VERSION_KHR); ctx.push_back(config.type.getMajorVersion());
++            ctx.push_back(EGL_CONTEXT_MINOR_VERSION_KHR); ctx.push_back(config.type.getMinorVersion());
++            if (config.type.getMajorVersion() > 3 || (config.type.getMajorVersion() == 3 && config.type.getMinorVersion() >= 2)) {
++                ctx.push_back(EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR);
++                ctx.push_back(glu::isContextTypeGLCore(config.type) ? EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR : EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT_KHR);
++            }
++            ctx.push_back(EGL_NONE);
++            m_context = eglCreateContext(m_display, selected, EGL_NO_CONTEXT, ctx.data());
++            if (m_context == EGL_NO_CONTEXT || !eglMakeCurrent(m_display,m_surface,m_surface,m_context))
++                TCU_THROW(NotSupportedError, "Requested EGL OpenGL context is unavailable");
++            EglLoader loader; glu::initFunctions(&m_functions,&loader,config.type.getAPI());
++            const char *version = reinterpret_cast<const char *>(m_functions.getString(GL_VERSION));
++            int major=0,minor=0;
++            if (!version || std::sscanf(version,"%d.%d",&major,&minor)!=2 ||
++                major*100+minor < config.type.getMajorVersion()*100+config.type.getMinorVersion())
++                TCU_THROW(NotSupportedError, "EGL returned a lower OpenGL version than requested");
++            if (config.type.getMajorVersion() > 3 || (config.type.getMajorVersion() == 3 && config.type.getMinorVersion() >= 2)) {
++                int mask=0; m_functions.getIntegerv(GL_CONTEXT_PROFILE_MASK,&mask);
++                const int wanted = glu::isContextTypeGLCore(config.type) ? GL_CONTEXT_CORE_PROFILE_BIT : GL_CONTEXT_COMPATIBILITY_PROFILE_BIT;
++                if (!(mask & wanted)) TCU_THROW(NotSupportedError, "EGL returned the wrong OpenGL profile");
++            }
++            m_target = tcu::RenderTarget(width,height,tcu::PixelFormat(red,green,blue,alpha),depth,stencil,samples);
++        } catch (...) { cleanup(); throw; }
++    }
++    ~EglContext() override { cleanup(); }
++    glu::ContextType getType() const override { return m_type; }
++    const glw::Functions &getFunctions() const override { return m_functions; }
++    const tcu::RenderTarget &getRenderTarget() const override { return m_target; }
++    glw::GenericFuncType getProcAddress(const char *name) const override { return EglLoader().get(name); }
++    void makeCurrent() override { if (!eglMakeCurrent(m_display,m_surface,m_surface,m_context)) TCU_THROW(ResourceError, "eglMakeCurrent failed"); }
++    void postIterate() override { m_functions.finish(); }
++private:
++    void cleanup() {
++        if (m_display != EGL_NO_DISPLAY) {
++            if (m_context != EGL_NO_CONTEXT && eglGetCurrentContext() == m_context && eglGetCurrentDisplay() == m_display)
++                eglMakeCurrent(m_display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
++            if (m_context != EGL_NO_CONTEXT) eglDestroyContext(m_display,m_context);
++            if (m_surface != EGL_NO_SURFACE) eglDestroySurface(m_display,m_surface);
++            if (m_displayAcquired) {
++                std::lock_guard<std::mutex> lock(displayMutex);
++                if (--displayUsers == 0) {
++                    eglTerminate(m_display);
++                    sharedDisplay = EGL_NO_DISPLAY;
++                }
++                m_displayAcquired = false;
++            }
++            m_display=EGL_NO_DISPLAY; m_context=EGL_NO_CONTEXT; m_surface=EGL_NO_SURFACE;
++        }
++    }
++    glu::ContextType m_type; EGLDisplay m_display; EGLContext m_context; EGLSurface m_surface; bool m_displayAcquired;
++    glw::Functions m_functions; tcu::RenderTarget m_target;
++};
++class EglFactory : public glu::ContextFactory {
++public:
++    EglFactory() : glu::ContextFactory("egl", "Haiku EGL offscreen pbuffer") {}
++    glu::RenderContext *createContext(const glu::RenderConfig &config, const tcu::CommandLine &,
++                                     const glu::RenderContext *shared) const override {
++        if (shared) TCU_THROW(NotSupportedError, "Shared Haiku EGL contexts are not supported");
++        return new EglContext(config);
++    }
++};
++}
++glu::ContextFactory *createHaikuEglFactory() { return new EglFactory(); }
+diff --git a/framework/platform/haiku/tcuHaikuPlatform.cpp b/framework/platform/haiku/tcuHaikuPlatform.cpp
+new file mode 100644
+index 0000000..a7e7236
+--- /dev/null
++++ b/framework/platform/haiku/tcuHaikuPlatform.cpp
+@@ -0,0 +1,185 @@
++/* SPDX-License-Identifier: MIT */
++/* Native RenkuOS/Haiku OpenGL Kit context adapter. */
++
++#include "tcuPlatform.hpp"
++#include "tcuRenderTarget.hpp"
++#include "gluPlatform.hpp"
++#include "gluRenderContext.hpp"
++#include "gluRenderConfig.hpp"
++#include "glwFunctions.hpp"
++#include "glwFunctionLoader.hpp"
++
++#include <GL/glut.h>
++#include <cstdio>
++
++glu::ContextFactory *createHaikuEglFactory();
++
++namespace
++{
++
++class NativeLoader : public glw::FunctionLoader
++{
++public:
++    glw::GenericFuncType get(const char *name) const override
++    {
++        return reinterpret_cast<glw::GenericFuncType>(glutGetProcAddress(name));
++    }
++};
++
++void requireMinimum(int requested, int actual, const char *message)
++{
++    if (requested != glu::RenderConfig::DONT_CARE && requested > actual)
++        TCU_THROW(NotSupportedError, message);
++}
++
++class NativeContext : public glu::RenderContext
++{
++public:
++    explicit NativeContext(const glu::RenderConfig &config)
++        : m_type(config.type), m_window(0)
++    {
++        if (glu::isContextTypeES(config.type))
++            TCU_THROW(NotSupportedError, "Native GLUT does not create OpenGL ES contexts");
++        // OpenGL before 3.2 has no core/compatibility profile mask.
++        if (glu::isContextTypeGLCore(config.type) &&
++            (config.type.getMajorVersion() > 3 ||
++             (config.type.getMajorVersion() == 3 && config.type.getMinorVersion() >= 2)))
++            TCU_THROW(NotSupportedError, "Native GLUT cannot request a core profile");
++        if (config.type.getFlags() != 0)
++            TCU_THROW(NotSupportedError, "Native GLUT cannot request context flags");
++        if (config.resetNotificationStrategy != glu::RESET_NOTIFICATION_STRATEGY_NOT_SPECIFIED)
++            TCU_THROW(NotSupportedError, "Native GLUT cannot request reset notification");
++        if (config.surfaceType != glu::RenderConfig::SURFACETYPE_DONT_CARE &&
++            config.surfaceType != glu::RenderConfig::SURFACETYPE_WINDOW)
++            TCU_THROW(NotSupportedError, "Native GLUT provides window surfaces only");
++        if (config.windowVisibility == glu::RenderConfig::VISIBILITY_FULLSCREEN)
++            TCU_THROW(NotSupportedError, "Fullscreen contexts are not supported");
++        if (config.componentType == glu::RenderConfig::COMPONENT_TYPE_FLOAT)
++            TCU_THROW(NotSupportedError, "Floating-point default framebuffers are not supported");
++        if (config.id != glu::RenderConfig::DONT_CARE)
++            TCU_THROW(NotSupportedError, "Native GLUT does not expose numbered configurations");
++        if (config.numSamples > 1)
++            TCU_THROW(NotSupportedError, "Native GLUT cannot request a multisampled default framebuffer");
++
++        static bool initialized = false;
++        if (!initialized)
++        {
++            char name[] = "glcts";
++            char *argv[] = {name, nullptr};
++            int argc = 1;
++            glutInit(&argc, argv);
++            initialized = true;
++        }
++
++        const int width = config.width == glu::RenderConfig::DONT_CARE ? 256 : config.width;
++        const int height = config.height == glu::RenderConfig::DONT_CARE ? 256 : config.height;
++        if (width <= 0 || height <= 0)
++            TCU_THROW(NotSupportedError, "Invalid native window dimensions");
++
++        unsigned int visual = GLUT_RGBA | GLUT_DOUBLE;
++        if (config.alphaBits != 0)
++            visual |= GLUT_ALPHA;
++        if (config.depthBits != 0)
++            visual |= GLUT_DEPTH;
++        if (config.stencilBits != 0)
++            visual |= GLUT_STENCIL;
++        glutInitDisplayMode(visual);
++        glutInitWindowSize(width, height);
++        m_window = glutCreateWindow("RenkuOS OpenGL CTS");
++        if (m_window <= 0)
++            TCU_THROW(ResourceError, "Could not create the native OpenGL window");
++
++        try
++        {
++            const char *version = reinterpret_cast<const char *>(glGetString(GL_VERSION));
++            int major = 0, minor = 0;
++            if (!version || std::sscanf(version, "%d.%d", &major, &minor) != 2)
++                TCU_THROW(ResourceError, "Could not query the actual OpenGL version");
++            requireMinimum(config.type.getMajorVersion() * 100 + config.type.getMinorVersion(),
++                           major * 100 + minor, "Requested OpenGL version is unavailable");
++
++            int red = 0, green = 0, blue = 0, alpha = 0, depth = 0, stencil = 0, samples = 0;
++            glGetIntegerv(GL_RED_BITS, &red);
++            glGetIntegerv(GL_GREEN_BITS, &green);
++            glGetIntegerv(GL_BLUE_BITS, &blue);
++            glGetIntegerv(GL_ALPHA_BITS, &alpha);
++            glGetIntegerv(GL_DEPTH_BITS, &depth);
++            glGetIntegerv(GL_STENCIL_BITS, &stencil);
++            if (major > 1 || (major == 1 && minor >= 3))
++                glGetIntegerv(GL_SAMPLES, &samples);
++            requireMinimum(config.redBits, red, "Insufficient red bits");
++            requireMinimum(config.greenBits, green, "Insufficient green bits");
++            requireMinimum(config.blueBits, blue, "Insufficient blue bits");
++            requireMinimum(config.alphaBits, alpha, "Insufficient alpha bits");
++            requireMinimum(config.depthBits, depth, "Insufficient depth bits");
++            requireMinimum(config.stencilBits, stencil, "Insufficient stencil bits");
++            if (config.numSamples != glu::RenderConfig::DONT_CARE && config.numSamples != samples)
++                TCU_THROW(NotSupportedError, "Requested default-framebuffer sample count is unavailable");
++            m_target = tcu::RenderTarget(glutGet(GLUT_WINDOW_WIDTH), glutGet(GLUT_WINDOW_HEIGHT),
++                                        tcu::PixelFormat(red, green, blue, alpha), depth, stencil, samples);
++            NativeLoader loader;
++            glu::initFunctions(&m_functions, &loader, config.type.getAPI());
++            if (config.windowVisibility == glu::RenderConfig::VISIBILITY_HIDDEN)
++                glutHideWindow();
++        }
++        catch (...)
++        {
++            glutDestroyWindow(m_window);
++            m_window = 0;
++            throw;
++        }
++    }
++
++    ~NativeContext() override
++    {
++        if (m_window)
++            glutDestroyWindow(m_window);
++    }
++
++    glu::ContextType getType() const override { return m_type; }
++    const glw::Functions &getFunctions() const override { return m_functions; }
++    const tcu::RenderTarget &getRenderTarget() const override { return m_target; }
++    glw::GenericFuncType getProcAddress(const char *name) const override
++    {
++        return NativeLoader().get(name);
++    }
++    void makeCurrent() override { glutSetWindow(m_window); }
++    void postIterate() override
++    {
++        makeCurrent();
++        glutSwapBuffers();
++    }
++
++private:
++    glu::ContextType m_type;
++    int m_window;
++    glw::Functions m_functions;
++    tcu::RenderTarget m_target;
++};
++
++class NativeFactory : public glu::ContextFactory
++{
++public:
++    NativeFactory() : glu::ContextFactory("haiku", "RenkuOS / Haiku native OpenGL Kit") {}
++    glu::RenderContext *createContext(const glu::RenderConfig &config, const tcu::CommandLine &,
++                                     const glu::RenderContext *shared) const override
++    {
++        if (shared)
++            TCU_THROW(NotSupportedError, "Explicit native context sharing is unavailable");
++        return new NativeContext(config);
++    }
++};
++
++class NativePlatform : public tcu::Platform, public glu::Platform
++{
++public:
++    NativePlatform() { m_contextFactoryRegistry.registerFactory(createHaikuEglFactory()); m_contextFactoryRegistry.registerFactory(new NativeFactory()); }
++    const glu::Platform &getGLPlatform() const override { return *this; }
++};
++
++} // anonymous namespace
++
++tcu::Platform *createPlatform()
++{
++    return new NativePlatform();
++}
+diff --git a/framework/qphelper/qpReleaseInfo.inl b/framework/qphelper/qpReleaseInfo.inl
+new file mode 100644
+index 0000000..62a8fd1
+--- /dev/null
++++ b/framework/qphelper/qpReleaseInfo.inl
+@@ -0,0 +1,8 @@
++/* WARNING: auto-generated file, use gen_release_info.py to modify */
++
++#define DEQP_RELEASE_NAME                "5bb4c7e83acea0fc73e3333625e4f20542e584d0"
++#define DEQP_RELEASE_ID                    0x5bb4c7e8
++#define DEQP_RELEASE_GLSL_NAME            "git-83f75db6ada23801a65eed1cde4763a0a5bfbda6"
++#define DEQP_RELEASE_SPIRV_TOOLS_NAME    "git-b570f00a782a7bf4006964e8284dd8c10c4c549b"
++#define DEQP_RELEASE_SPIRV_HEADERS_NAME    "git-6efe5ae6b7c6ad29da3f2cc3f164b9c3d72b78b1"
++
+diff --git a/targets/haiku/README.md b/targets/haiku/README.md
+new file mode 100644
+index 0000000..702fbd9
+--- /dev/null
++++ b/targets/haiku/README.md
+@@ -0,0 +1,38 @@
++# OpenGL CTS on RenkuOS / Haiku
++
++This target provides two OpenGL context backends:
++
++- `egl` (default) uses an EGL pbuffer. It can request desktop OpenGL core and compatibility profiles and supports the Mesa 26 llvmpipe stack in the test VM.
++- `haiku` uses the native GLUT/OpenGL Kit window and requests compatibility contexts. Select it with `--deqp-gl-context-type=haiku`.
++
++The launcher defaults the EGL backend to `--deqp-surface-type=pbuffer`; an explicitly supplied surface type is preserved. For FBO mode it defaults unspecified width and height to 256 to avoid allocating the maximum renderbuffer size. The GLUT backend defaults to its window surface. The EGL backend currently rejects explicit native windows, pixmaps, shared contexts, OpenGL ES, context flags, and reset-notification strategies. It selects from the EGL configurations the driver advertises; an unavailable configuration is reported as unsupported. With the Mesa 26.1.8 Haiku port, EGL pbuffer support requires the included `mesa26-pbuffer.patch`. Mesa's original pbuffer implementation dereferences a null native window hook.
++
++## Build
++
++With GCC, `haiku_devel`, `libglvnd_devel`, `mesa_devel`, `libpng16_devel`, `zlib_devel`, CMake, Ninja, and Python 3.10 installed, fetch the upstream dependencies pinned by the source revision and run:
++
++```sh
++cmake -S . -B build -G Ninja \
++    -DDEQP_TARGET=haiku \
++    -DPYTHON_EXECUTABLE=/system/bin/python3.10 \
++    -DCMAKE_POLICY_DEFAULT_CMP0148=OLD \
++    -DCMAKE_BUILD_TYPE=Release \
++    -DSELECTED_BUILD_TARGETS=glcts
++cmake --build build --target glcts -j4
++```
++
++Keep the `gl_cts`, `gles2`, `gles3`, and `gles31` data directories with the executable. The launcher sets the archive path and disables the optional device-loss monitor unless explicitly configured. It also disables Mesa shader caching by default because cache-enabled runs sometimes stall at shutdown on this VM. Set `MESA_SHADER_CACHE_DISABLE=false` before launching CTS to test the cache; that may reproduce the stall.
++
++## Run
++
++```sh
++./run-glcts.sh --deqp-case='KHR-GL46.info.*' --deqp-log-filename=gl46-info.qpa
++./run-glcts.sh --deqp-case='KHR-GL46.aggressive_optimizations.*' --deqp-log-filename=gl46-shaders.qpa
++./run-glcts.sh --deqp-gl-context-type=haiku --deqp-case=KHR-GL30.info.renderer
++```
++
++`gl_cts/data/mustpass/gl/khronos_mustpass/4.6.0.x/gl46-main.txt` contains the OpenGL 4.6 core main test list. Check the QPA renderer information before interpreting the results. The VM tested here uses CPU llvmpipe.
++
++## Verification
++
++On RenkuOS build00085, Mesa 26.1.8, LLVM 21.1.8 llvmpipe, the EGL backend passed the six GL46 info cases, the twelve GL46 aggressive shader optimization cases, and `KHR-GL46.buffer_storage.map_persistent_draw`. Four GL46 compute API checks and the GLUT `KHR-GL30.info.renderer` check also passed. A regression test verified two independent EGL contexts and rejection of an incompatible configuration without disrupting the first context. A broader deterministic sample of 755 cases from all 89 GL46 main-list groups was also run. Before fixes, 650 passed, 50 failed and 55 were unsupported; after the pbuffer alpha, orientation, sample-count and stencil fixes, 700 passed, none failed and 55 were unsupported. The full 16,498-case GL46 main list was not run, and these results are not a conformance certification.
+diff --git a/targets/haiku/haiku.cmake b/targets/haiku/haiku.cmake
+new file mode 100644
+index 0000000..ec0c0e2
+--- /dev/null
++++ b/targets/haiku/haiku.cmake
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: MIT
++set(DEQP_TARGET_NAME "RenkuOS / Haiku native OpenGL")
++find_package(OpenGL REQUIRED)
++find_package(GLUT REQUIRED)
++find_package(PkgConfig REQUIRED)
++pkg_check_modules(EGL REQUIRED egl)
++set(DEQP_PLATFORM_LIBRARIES ${GLUT_LIBRARIES} ${OPENGL_gl_LIBRARY} ${EGL_LIBRARIES} be)
++include_directories(${GLUT_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIR} ${EGL_INCLUDE_DIRS})
++set(TCUTIL_PLATFORM_SRCS haiku/tcuHaikuPlatform.cpp haiku/tcuHaikuEgl.cpp)
++configure_file("${CMAKE_CURRENT_LIST_DIR}/run-glcts.sh"
++    "${CMAKE_BINARY_DIR}/external/openglcts/modules/run-glcts.sh" COPYONLY)
+diff --git a/targets/haiku/run-glcts.sh b/targets/haiku/run-glcts.sh
+new file mode 100755
+index 0000000..a49a331
+--- /dev/null
++++ b/targets/haiku/run-glcts.sh
+@@ -0,0 +1,50 @@
++#!/bin/sh
++# SPDX-License-Identifier: MIT
++set -eu
++bundle_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++# Mesa shader-cache workers can stall CTS shutdown on this Haiku build.
++# Set MESA_SHADER_CACHE_DISABLE=false explicitly to test the cache.
++if [ "${MESA_SHADER_CACHE_DISABLE+x}" != x ]; then
++    MESA_SHADER_CACHE_DISABLE=true
++    export MESA_SHADER_CACHE_DISABLE
++fi
++archive_option="--deqp-archive-dir=$bundle_dir"
++reset_option=--deqp-terminate-on-device-lost=disable
++surface_option=--deqp-surface-type=pbuffer
++width_option=--deqp-surface-width=256
++height_option=--deqp-surface-height=256
++native_factory=no
++fbo_surface=no
++context_arg=no
++surface_arg=no
++for argument do
++    if [ "$context_arg" = yes ]; then
++        [ "$argument" = haiku ] && native_factory=yes
++        context_arg=no
++        continue
++    fi
++    if [ "$surface_arg" = yes ]; then
++        [ "$argument" = fbo ] && fbo_surface=yes
++        surface_arg=no
++        continue
++    fi
++    case "$argument" in
++        --deqp-archive-dir|--deqp-archive-dir=*) archive_option= ;;
++        --deqp-terminate-on-device-lost|--deqp-terminate-on-device-lost=*) reset_option= ;;
++        --deqp-surface-type=fbo) surface_option=; fbo_surface=yes ;;
++        --deqp-surface-type=*) surface_option= ;;
++        --deqp-surface-type) surface_option=; surface_arg=yes ;;
++        --deqp-surface-width|--deqp-surface-width=*) width_option= ;;
++        --deqp-surface-height|--deqp-surface-height=*) height_option= ;;
++        --deqp-gl-context-type=haiku) native_factory=yes ;;
++        --deqp-gl-context-type) context_arg=yes ;;
++    esac
++done
++[ "$native_factory" = yes ] && surface_option=
++[ "$fbo_surface" = yes ] || { width_option=; height_option=; }
++[ -n "$archive_option" ] && set -- "$archive_option" "$@"
++[ -n "$reset_option" ] && set -- "$reset_option" "$@"
++[ -n "$surface_option" ] && set -- "$surface_option" "$@"
++[ -n "$width_option" ] && set -- "$width_option" "$@"
++[ -n "$height_option" ] && set -- "$height_option" "$@"
++exec "$bundle_dir/glcts" "$@"

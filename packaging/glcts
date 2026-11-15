@@ -1,0 +1,3 @@
+#!/bin/sh
+# CTS launcher supplies resource and EGL surface defaults.
+exec /boot/system/data/renkuos-opengl-tests/opengl-cts/run-glcts.sh "$@"

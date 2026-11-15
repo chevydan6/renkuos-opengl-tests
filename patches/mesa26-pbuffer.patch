@@ -1,0 +1,76 @@
+diff --git a/src/egl/drivers/haiku/egl_haiku.cpp b/src/egl/drivers/haiku/egl_haiku.cpp
+index 7aac030f..0e0df178 100644
+--- a/src/egl/drivers/haiku/egl_haiku.cpp
++++ b/src/egl/drivers/haiku/egl_haiku.cpp
+@@ -108,7 +108,7 @@ haiku_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
+    }
+ 
+    struct st_visual visual;
+-   hgl_get_st_visual(&visual, HGL_DOUBLE | HGL_DEPTH);
++   hgl_get_st_visual(&visual, HGL_DOUBLE | HGL_DEPTH | HGL_ALPHA);
+ 
+    wgl_surf->fb =
+       hgl_create_st_framebuffer(hgl_dpy->disp, &visual, native_window);
+@@ -150,7 +150,7 @@ haiku_create_pbuffer_surface(_EGLDisplay *disp, _EGLConfig *conf,
+    }
+ 
+    struct st_visual visual;
+-   hgl_get_st_visual(&visual, HGL_DOUBLE | HGL_DEPTH);
++   hgl_get_st_visual(&visual, HGL_DOUBLE | HGL_DEPTH | HGL_ALPHA);
+ 
+    wgl_surf->fb = hgl_create_st_framebuffer(hgl_dpy->disp, &visual, NULL);
+    if (!wgl_surf->fb) {
+@@ -189,6 +189,8 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
+ static void
+ update_size(struct hgl_buffer *buffer)
+ {
++   if (!buffer->winsysContext)
++      return; /* Pbuffers already have their requested dimensions. */
+    uint32_t newWidth, newHeight;
+    ((BitmapHook *)buffer->winsysContext)->GetSize(newWidth, newHeight);
+    if (buffer->newWidth != newWidth || buffer->newHeight != newHeight) {
+@@ -273,7 +275,7 @@ haiku_add_configs_for_visuals(_EGLDisplay *disp)
+    conf->base.ConfigID = 1;
+    conf->base.BindToTextureRGB = EGL_FALSE;
+    conf->base.BindToTextureRGBA = EGL_FALSE;
+-   conf->base.StencilSize = 0;
++   conf->base.StencilSize = 8;
+    conf->base.TransparentType = EGL_NONE;
+    conf->base.NativeRenderable = EGL_TRUE; // Let's say yes
+    conf->base.NativeVisualID = 0;          // No visual
+@@ -429,7 +431,7 @@ haiku_create_context(_EGLDisplay *disp, _EGLConfig *conf,
+    struct haiku_egl_display *hgl_dpy = haiku_egl_display(disp);
+ 
+    struct st_visual visual;
+-   hgl_get_st_visual(&visual, HGL_DOUBLE | HGL_DEPTH);
++   hgl_get_st_visual(&visual, HGL_DOUBLE | HGL_DEPTH | HGL_ALPHA);
+ 
+    struct haiku_egl_context *context =
+       (struct haiku_egl_context *)calloc(1, sizeof(*context));
+@@ -515,6 +517,14 @@ haiku_make_current(_EGLDisplay *disp, _EGLSurface *dsurf, _EGLSurface *rsurf,
+       st_api_make_current(hgl_ctx->ctx->st,
+                           hgl_dsurf == NULL ? NULL : &hgl_dsurf->fb->base,
+                           hgl_rsurf == NULL ? NULL : &hgl_rsurf->fb->base);
++      // Pbuffers have no native top-left window to display. Treat them as
++      // bottom-left offscreen buffers, like a texture framebuffer.
++      struct gl_context *mesa_ctx = hgl_ctx->ctx->st->ctx;
++      if (hgl_dsurf && !hgl_dsurf->fb->winsysContext)
++         mesa_ctx->WinSysDrawBuffer->FlipY = false;
++      if (hgl_rsurf && !hgl_rsurf->fb->winsysContext)
++         mesa_ctx->WinSysReadBuffer->FlipY = false;
++      mesa_ctx->NewState |= _NEW_BUFFERS;
+    }
+ 
+    if (old_dsurf != NULL)
+diff --git a/src/gallium/frontends/hgl/hgl.c b/src/gallium/frontends/hgl/hgl.c
+index 106a6a60..0de7ec8f 100644
+--- a/src/gallium/frontends/hgl/hgl.c
++++ b/src/gallium/frontends/hgl/hgl.c
+@@ -317,6 +317,7 @@ hgl_get_st_visual(struct st_visual* visual, ulong options)
+ 	CALLED();
+ 
+ 	assert(visual);
++	memset(visual, 0, sizeof(*visual));
+ 
+ 	// Determine color format
+ 	if ((options & HGL_INDEX) != 0) {

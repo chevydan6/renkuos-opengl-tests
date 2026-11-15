@@ -1,0 +1,294 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ee54981..0137146 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -35,6 +35,17 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Linux|FreeBSD")
+ 
+ 	set(DEFAULT_GLES_TESTS_BUILD ON)
+ 	set(DEFAULT_VK_TESTS_BUILD ON)
++elseif(CMAKE_SYSTEM_NAME STREQUAL "Haiku")
++	# RenkuOS and Haiku use native GLUT rather than X11 or Waffle.
++	set(DEFAULT_EGL OFF)
++	set(DEFAULT_GLX OFF)
++	set(DEFAULT_WGL OFF)
++	set(DEFAULT_WAFFLE OFF)
++	set(DEFAULT_GBM OFF)
++	set(DEFAULT_WAYLAND OFF)
++	set(DEFAULT_X11 OFF)
++	set(DEFAULT_GLES_TESTS_BUILD OFF)
++	set(DEFAULT_VK_TESTS_BUILD OFF)
+ elseif(APPLE)
+ 	set(DEFAULT_EGL OFF)
+ 	set(DEFAULT_GLX OFF)
+@@ -565,7 +576,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+ 	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--enable-new-dtags")
+ endif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+ 
+-SET(CMAKE_INSTALL_RPATH "${PIGLIT_INSTALL_FULL_LIBDIR}/lib")
++if(CMAKE_SYSTEM_NAME STREQUAL "Haiku")
++	# Locate private libraries after moving an installed test bundle.
++	set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib;$ORIGIN")
++else()
++	set(CMAKE_INSTALL_RPATH "${PIGLIT_INSTALL_FULL_LIBDIR}/lib")
++endif()
+ 
+ configure_file(
+ 	"${piglit_SOURCE_DIR}/tests/util/config.h.in"
+diff --git a/README.md b/README.md
+index 731edaa..49a7347 100644
+--- a/README.md
++++ b/README.md
+@@ -167,6 +167,51 @@ CD to piglit directory.
+     cmake -H. -Bbuild -G "Ninja" -DGLEXT_INCLUDE_DIR=\path\to\glext -DPIGLIT_USE_WAFFLE=TRUE -DWaffle_INCLUDE_DIRS=\path\to\waffle\include\waffle -DWaffle_LDFLAGS=\path\to\waffle\lib\libwaffle-1.dll.a
+ 
+ 
++### 2.6 RenkuOS / Haiku
++
++The native port uses GLUT and the OpenGL Kit. CMake identifies RenkuOS as
++`Haiku` and selects desktop OpenGL tests with native GLUT by default.
++
++With GCC, `haiku_devel`, `mesa_devel` and `libpng16_devel` installed, install
++the remaining build dependencies:
++
++    pkgman install -y cmake ninja python3.10 numpy_python310 mako_python310 glu_devel
++
++From the source directory, build and install into a private directory:
++
++    cmake -S . -B build -G Ninja \
++        -DPYTHON_EXECUTABLE=/system/bin/python3.10 \
++        -DCMAKE_INSTALL_PREFIX=/boot/home/piglit
++    cmake --build build -j4
++    cmake --install build
++
++Run the installed copy so binaries, generated shaders and profiles are all
++found together. The following commands also work after relocating that
++installation to another directory:
++
++    python3.10 /boot/home/piglit/bin/piglit run -1 --timeout 30 sanity /boot/home/piglit-results/sanity
++    python3.10 /boot/home/piglit/bin/piglit summary console -s /boot/home/piglit-results/sanity
++
++For a full desktop OpenGL run, use the `opengl` profile:
++
++    python3.10 /boot/home/piglit/bin/piglit run -1 --timeout 300 opengl /boot/home/piglit-results/opengl
++
++The `spec/!opengl 1.1/glinfo` result records the actual renderer, OpenGL and
++GLSL versions. Check it when testing an N100 driver: `llvmpipe` and `softpipe`
++identify CPU rendering. Piglit uses whichever renderer the OpenGL Kit selects;
++this port does not force software rendering.
++
++Preserve a results directory from each driver version. To compare runs:
++
++    python3.10 /boot/home/piglit/bin/piglit summary console -s /boot/home/piglit-results/before /boot/home/piglit-results/after
++
++This backend exercises native desktop OpenGL. GLX, WGL, Waffle, EGL, OpenGL ES,
++and DMA-BUF tests are disabled by default. Native GLUT cannot request a core
++profile or multisampled default framebuffer; tests requiring those context
++types report skips. Tests still check their own advertised version and
++extension requirements when the optional `wflinfo` tool is absent.
++
++
+ ## 3. How to run tests
+ 
+ Make sure that everything is set up correctly:
+diff --git a/framework/test/base.py b/framework/test/base.py
+index 0efa383..feb125d 100644
+--- a/framework/test/base.py
++++ b/framework/test/base.py
+@@ -300,12 +300,18 @@ class Test(metaclass=abc.ABCMeta):
+             # 3.x, since # TimeoutExpired is never raised by the python 2.7
+             # fallback code.
+ 
+-            proc.terminate()
++            try:
++                proc.terminate()
++            except ProcessLookupError:
++                pass  # The test exited after communicate() timed out.
+ 
+             if sys.platform != 'win32':
+                 if proc.poll() is None:
+                     time.sleep(3)
+-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
++                    try:
++                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass  # The test exited during the grace period.
+ 
+             # Since the process isn't running it's safe to get any remaining
+             # stdout/stderr values out and store them.
+diff --git a/framework/wflinfo.py b/framework/wflinfo.py
+index 5058a01..f264dbf 100644
+--- a/framework/wflinfo.py
++++ b/framework/wflinfo.py
+@@ -144,7 +144,9 @@ class WflInfo(object):
+                 raw = self.__call_wflinfo(
+                     ['--verbose', '--api', 'gl', '--profile', profile])
+             except StopWflinfo as e:
+-                if e.reason not in ['Called', 'OSError']:
++                if e.reason == 'OSError':
++                    return None
++                if e.reason != 'Called':
+                     raise
+             else:
+                 try:
+@@ -158,7 +160,9 @@ class WflInfo(object):
+             try:
+                 raw = self.__call_wflinfo(['--verbose', '--api', profile])
+             except StopWflinfo as e:
+-                if e.reason not in ['Called', 'OSError']:
++                if e.reason == 'OSError':
++                    return None
++                if e.reason != 'Called':
+                     raise
+             else:
+                 try:
+@@ -179,7 +183,9 @@ class WflInfo(object):
+             try:
+                 raw = self.__call_wflinfo(['--api', 'gl', '--profile', profile])
+             except StopWflinfo as e:
+-                if e.reason not in ['Called', 'OSError']:
++                if e.reason == 'OSError':
++                    return None
++                if e.reason != 'Called':
+                     raise
+             else:
+                 try:
+@@ -194,7 +200,9 @@ class WflInfo(object):
+             try:
+                 raw = self.__call_wflinfo(['--api', profile])
+             except StopWflinfo as e:
+-                if e.reason not in ['Called', 'OSError']:
++                if e.reason == 'OSError':
++                    return None
++                if e.reason != 'Called':
+                     raise
+             else:
+                 try:
+diff --git a/tests/util/piglit-dispatch-init.c b/tests/util/piglit-dispatch-init.c
+index 7a57cfb..949fda7 100644
+--- a/tests/util/piglit-dispatch-init.c
++++ b/tests/util/piglit-dispatch-init.c
+@@ -175,6 +175,21 @@ get_core_proc_address(const char *function_name, int gl_10x_version)
+ 	return get_ext_proc_address(function_name);
+ }
+ 
++#elif defined(__HAIKU__) && !defined(PIGLIT_USE_WAFFLE)
++
++static piglit_dispatch_function_ptr
++get_ext_proc_address(const char *function_name)
++{
++	return (piglit_dispatch_function_ptr) glutGetProcAddress(function_name);
++}
++
++static piglit_dispatch_function_ptr
++get_core_proc_address(const char *function_name, int gl_10x_version)
++{
++	(void) gl_10x_version;
++	return get_ext_proc_address(function_name);
++}
++
+ #else /* Linux */
+ 
+ /**
+diff --git a/unittests/framework/test/test_base.py b/unittests/framework/test/test_base.py
+index db7a50f..d9de0f2 100644
+--- a/unittests/framework/test/test_base.py
++++ b/unittests/framework/test/test_base.py
+@@ -23,6 +23,7 @@
+ 
+ import os
+ import textwrap
++from unittest import mock
+ try:
+     import subprocess32 as subprocess
+ except ImportError:
+@@ -582,3 +583,31 @@ class TestReducedProcessMixin(object):
+             assert test.result.subtests['a'] == status.PASS
+             assert test.result.subtests['b'] == status.PASS
+             assert test.result.subtests['c'] == status.CRASH
++
++
++@pytest.mark.skipif(os.name != 'posix', reason='Requires POSIX process groups')
++@pytest.mark.parametrize('stage', ['terminate', 'getpgid', 'killpg'])
++def test_timeout_process_exits_during_cleanup(stage):
++    """A process disappearing during timeout cleanup is still a timeout."""
++    proc = mock.Mock()
++    proc.pid = 123
++    proc.poll.return_value = None
++    proc.communicate.side_effect = [subprocess.TimeoutExpired('test', 1),
++                                    ('partial output', '')]
++    missing = ProcessLookupError(base.errno.ESRCH, 'process exited')
++    if stage == 'terminate':
++        proc.terminate.side_effect = missing
++    with mock.patch.object(base.subprocess, 'Popen', return_value=proc), \
++            mock.patch.object(base.time, 'sleep'), \
++            mock.patch.object(base.os, 'getpgid', return_value=123) as getpgid, \
++            mock.patch.object(base.os, 'killpg') as killpg:
++        if stage == 'getpgid':
++            getpgid.side_effect = missing
++        elif stage == 'killpg':
++            killpg.side_effect = missing
++        test = _Test(['test'])
++        test.timeout = 1
++        test.run()
++        assert test.result.result == status.TIMEOUT
++        assert 'exceeded timeout' in test.result.out
++        assert proc.communicate.call_count == 2
+diff --git a/unittests/framework/test_wflinfo.py b/unittests/framework/test_wflinfo.py
+index 3414c1b..a0be83e 100644
+--- a/unittests/framework/test_wflinfo.py
++++ b/unittests/framework/test_wflinfo.py
+@@ -21,6 +21,7 @@
+ 
+ """Test the wflinfo module."""
+ 
++import errno
+ import subprocess
+ import textwrap
+ from unittest import mock
+@@ -39,7 +40,7 @@ def _has_wflinfo():
+     except subprocess.CalledProcessError:
+         return False
+     except OSError as e:
+-        if e.errno != 2:
++        if e.errno != errno.ENOENT:
+             raise
+         return False
+     return True
+@@ -352,3 +353,37 @@ class TestWflInfo(object):
+             gracefully.
+             """
+             assert inst.core.shader_version == 0.0
++
++
++@pytest.mark.parametrize('profile', ['core', 'compat', 'none', 'gles2', 'gles3'])
++@pytest.mark.parametrize('getter', ['shader', 'language'])
++def test_missing_wflinfo_has_unknown_version(profile, getter):
++    """Missing wflinfo must not suppress tests that can check their own API."""
++    with mock.patch.object(wflinfo.WflInfo, '_WflInfo__call_wflinfo',
++                           side_effect=wflinfo.StopWflinfo('OSError')):
++        info = wflinfo.WflInfo()
++        query = getattr(info, '_WflInfo__get_{}_version'.format(getter))
++        assert query(profile) is None
++
++
++@pytest.mark.parametrize('getter', ['shader', 'language'])
++def test_unavailable_wflinfo_profile_has_zero_version(getter):
++    """A queried but unsupported profile remains distinct from unknown."""
++    with mock.patch.object(wflinfo.WflInfo, '_WflInfo__call_wflinfo',
++                           side_effect=wflinfo.StopWflinfo('Called')):
++        info = wflinfo.WflInfo()
++        query = getattr(info, '_WflInfo__get_{}_version'.format(getter))
++        assert query('core') == 0.0
++
++
++@pytest.mark.parametrize('api', ['core', 'compat', 'gles2'])
++def test_missing_wflinfo_does_not_fast_skip(api):
++    """Let test binaries check requirements when the query tool is missing."""
++    from framework.test.opengl import FastSkip
++
++    with mock.patch.dict(wflinfo.OPTIONS.env, {'PIGLIT_PLATFORM': 'glx'}), \
++            mock.patch.object(wflinfo.WflInfo, '_WflInfo__shared_state', {}), \
++            mock.patch('framework.wflinfo.subprocess.check_output',
++                       side_effect=OSError(errno.ENOENT, 'wflinfo missing')):
++        with mock.patch.object(FastSkip, 'info', wflinfo.WflInfo()):
++            FastSkip(api=api, api_version=4.5, shader_version=4.5).test()

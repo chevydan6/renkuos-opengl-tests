@@ -1,0 +1,3 @@
+#!/bin/sh
+# The packaged Piglit data tree remains together and read-only.
+exec /boot/system/bin/python3.10 /boot/system/data/renkuos-opengl-tests/piglit/bin/piglit "$@"

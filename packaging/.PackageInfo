@@ -1,0 +1,34 @@
+name renkuos_opengl_tests
+version 2026.11.15-1
+architecture x86_64
+summary "Piglit and Khronos OpenGL CTS for RenkuOS"
+description "Desktop OpenGL driver testing tools, including Piglit and the Khronos OpenGL Conformance Test Suite."
+packager "RenkuOS local package builder <noreply@localhost>"
+vendor "RenkuOS community"
+licenses {
+    "MIT"
+    "Apache v2"
+    "BSD (2-clause)"
+    "BSD (3-clause)"
+}
+copyrights {
+    "2011-2026 Piglit contributors"
+    "2015-2026 The Khronos Group Inc."
+}
+provides {
+    renkuos_opengl_tests = 2026.11.15
+    cmd:piglit = 2026.11.15
+    cmd:glcts = 2026.11.15
+}
+requires {
+    haiku >= r1~beta6_hrev60072_815-1
+    cmd:python3.10 >= 3.10.22
+    numpy_python310
+    mako_python310
+    lib:libgl >= 1
+    lib:libegl >= 1
+    lib:libpng16 >= 16
+    lib:libz >= 1
+    lib:libstdc++ >= 6.0.32
+    lib:libgcc_s >= 1
+}
